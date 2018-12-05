@@ -13,18 +13,17 @@ class seq2seq(object):
         data = [
         ]
 
-        f = open("./static/answer")  # 返回一个文件对象
-        line = f.readline()  # 调用文件的 readline()方法
-        while line:
-            line = f.readline()
-            data.append(line)
-        f.close()
-        f = open("./static/question")  # 返回一个文件对象
-        line = f.readline()  # 调用文件的 readline()方法
-        while line:
-            line = f.readline()
-            data.append(line)
-        f.close()
+        question = open("./static/question")  # 返回一个文件对象
+        answer = open("./static/answer")  # 返回一个文件对象
+        line_answer = answer.readline()  # 调用文件的 readline()方法
+        line_question = question.readline()
+        while line_question and line_answer:
+            line_question = question.readline()
+            line_answer = answer.readline()
+            data.append(line_question)
+            data.append(line_answer)
+        answer.close()
+        question.close()
         word2vec = word2vector(vector_length=100)
         word2vec.train(data)
         vocabulary = word2vec.vocabulary
