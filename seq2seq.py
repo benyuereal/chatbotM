@@ -21,23 +21,75 @@ EOS_token = 1
 batch_size = 1
 
 
+def get_data():
+    data = [
+    ]
+
+    question = open(question_path)  # 返回一个文件对象
+    answer = open(answer_path)  # 返回一个文件对象
+    line_answer = answer.readline()  # 调用文件的 readline()方法
+    line_question = question.readline()
+    while line_question and line_answer:
+        line_question = question.readline()
+        line_answer = answer.readline()
+        data.append(line_question)
+        data.append(line_answer)
+    answer.close()
+    question.close()
+    return data
+
 class EncoderRNN(nn.Module):
     def __init__(self, input_size, hidden_size, n_layers=1):
         super(EncoderRNN, self).__init__()
-
+        self.model_path="./model/"
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.n_layers = n_layers
-
         self.embedding = nn.Embedding(input_size, hidden_size)
-        print(self.embedding.weight)
-
+        self.vocabulary_word = None
+        self.vocabulary_index = None
+        self.get_vocabulary()
         self.gru = nn.GRU(hidden_size, hidden_size, n_layers)
+
+    '''
+    获取字典数据
+    '''
+
+    def get_vocabulary(self):
+        try:
+            vocabulary_word = torch.load(self.model_path + 'vocabulary_word.pkl')
+            vocabulary_index = torch.load(self.model_path + 'vocabulary_index.pkl')
+            self.vocabulary_word = vocabulary_word
+            self.vocabulary_index = vocabulary_index
+        except Exception as e:
+            data = get_data()
+            word2vec = word2vector(vector_length=100)
+            word2vec.train(data)
+            vocabulary = word2vec.vocabulary
+            vocabulary_word = {}
+            vocabulary_index = {}
+            for item in vocabulary:
+                current = vocabulary[item]
+                huffman_vector = preprocessing.normalize(current['huffman_vector'])
+                index = current['index']
+                word_current = node(huffman_vector=huffman_vector, word=item, index=index)
+                vocabulary_word[item] = word_current
+                vocabulary_index[index] = word_current
+
+            self.vocabulary_word = vocabulary_word
+            self.vocabulary_index = vocabulary_index
+            torch.save(vocabulary_word, self.model_path + 'vocabulary_word.pkl')
+            torch.save(vocabulary_index, self.model_path + 'vocabulary_index.pkl')
 
     def forward(self, word_inputs, hidden):
         seq_len = len(word_inputs)
-        embedded = self.embedding(word_inputs).view(seq_len, 1, -1)
-        print(embedded)
+        embedded = []
+        for word_index in word_inputs:
+            index = word_index.numpy()[0]
+            vector = self.vocabulary_index[index].huffman_vector
+            embedded.append(vector)
+        embedded= torch.FloatTensor(embedded)
+        # embedded = self.embedding(word_inputs).view(seq_len, 1, -1)
         output, hidden = self.gru(embedded, hidden)
         return output, hidden
 
@@ -183,8 +235,12 @@ class seq2seq(nn.Module):
 
             inputs.append(enc)
             targets.append(dec)
+        if len(inputs[0]):
+            inputs = Variable(torch.LongTensor(inputs)).transpose(1, 0).contiguous()
+        else:
+            # inputs=Variable(torch.LongTensor([[1]])).transpose(1, 0).contiguous()
+            return self.next(1, shuffle=False)
 
-        inputs = Variable(torch.LongTensor(inputs)).transpose(1, 0).contiguous()
         targets = Variable(torch.LongTensor(targets)).transpose(1, 0).contiguous()
         if USE_CUDA:
             inputs = inputs.cuda()
@@ -221,15 +277,20 @@ class seq2seq(nn.Module):
                                                                                                   decoder_context,
                                                                                                   decoder_hidden,
                                                                                                   encoder_outputs)
-                loss += self.criterion(decoder_output, target_variable[di])
-                decoder_input = target_variable[di]
-                decoder_outputs.append(decoder_output.unsqueeze(0))
+                try:
+                    loss += self.criterion(decoder_output, target_variable[di])
+                    decoder_input = target_variable[di]
+                    decoder_outputs.append(decoder_output.unsqueeze(0))
+                except Exception as e:
+                    continue
+
         else:
             for di in range(target_length):
                 decoder_output, decoder_context, decoder_hidden, decoder_attention = self.decoder(decoder_input,
                                                                                                   decoder_context,
                                                                                                   decoder_hidden,
                                                                                                   encoder_outputs)
+                print(di)
                 loss += self.criterion(decoder_output, target_variable[di])
                 decoder_outputs.append(decoder_output.unsqueeze(0))
                 topv, topi = decoder_output.data.topk(1)
