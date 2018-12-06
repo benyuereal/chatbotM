@@ -1,6 +1,6 @@
 import random
 import time
-
+import pandas as pd
 import jieba
 import torch
 import torch.nn as nn
@@ -416,6 +416,152 @@ class seq2seq(nn.Module):
             self.vocabulary_index = vocabulary_index
             torch.save(vocabulary_word, self.model_path + 'vocabulary_word.pkl')
             torch.save(vocabulary_index, self.model_path + 'vocabulary_index.pkl')
+    def predict(self):
+        try:
+            self.load_state_dict(torch.load(self.model_path+'params.pkl'))
+        except Exception as e:
+            print(e)
+            print("No model!")
+        loss_track = []
+
+        # 加载字典
+        vocabulary_word = torch.load(self.model_path + 'vocabulary_word.pkl')
+        vocabulary_index = torch.load(self.model_path + 'vocabulary_index.pkl')
+        self.vocabulary_word = vocabulary_word
+        self.vocabulary_index = vocabulary_index
+
+        while True:
+            input_strs = input("me > ")
+            # 字符串转向量
+            segement = jieba.lcut(input_strs)
+            input_vec = [vocabulary_word[i] for i in segement]
+            input_vec = self.make_infer_fd(input_vec)
+
+            # inference
+            if self.beam_search:
+                samples = self.beamSearchDecoder(input_vec)
+                for sample in samples:
+                    outstrs = []
+                    for i in sample[0]:
+                        if i == 1:
+                            break
+                        outstrs.append(vocabulary_index[i].word)
+                    print("ai > ", "".join(outstrs), sample[3])
+            else:
+                logits = self.infer(input_vec)
+                _,v = torch.topk(logits, 1)
+                pre = v.cpu().data.numpy().T.tolist()[0][0]
+                outstrs = []
+                for i in pre:
+                    if i == 1:
+                        break
+                    outstrs.append(vocabulary_word[i])
+                print("ai > ", "".join(outstrs))
+
+    def make_infer_fd(self, input_vec):
+        inputs = []
+        enc = input_vec[:self.max_length] if len(input_vec) > self.max_length else input_vec
+        inputs.append([enc[0].index])
+        inputs = Variable(torch.LongTensor(inputs)).transpose(1, 0).contiguous()
+        if USE_CUDA:
+            inputs = inputs.cuda()
+        return inputs
+    def infer(self, input_variable):
+        input_length = input_variable.size()[0]
+
+        encoder_hidden = self.encoder.init_hidden()
+        encoder_outputs, encoder_hidden = self.encoder(input_variable, encoder_hidden)
+
+        decoder_input = Variable(torch.LongTensor([[SOS_token]]))
+        decoder_context = Variable(torch.zeros(1, self.decoder.hidden_size))
+        decoder_hidden = encoder_hidden
+        if USE_CUDA:
+            decoder_input = decoder_input.cuda()
+            decoder_context = decoder_context.cuda()
+        decoder_outputs = []
+
+        for i in range(self.max_length):
+            decoder_output, decoder_context, decoder_hidden, decoder_attention = self.decoder(decoder_input, decoder_context, decoder_hidden, encoder_outputs)
+            decoder_outputs.append(decoder_output.unsqueeze(0))
+            topv, topi = decoder_output.data.topk(1)
+            ni = topi[0][0]
+            decoder_input = Variable(torch.LongTensor([[ni]])) # Chosen word is next input
+            if USE_CUDA: decoder_input = decoder_input.cuda()
+            if ni == EOS_token: break
+
+        decoder_outputs = torch.cat(decoder_outputs, 0)
+        return decoder_outputs
+
+    def tensorToList(self, tensor):
+        return tensor.cpu().data.numpy().tolist()[0]
+
+    def beamSearchDecoder(self, input_variable):
+        input_length = input_variable.size()[0]
+        encoder_hidden = self.encoder.init_hidden()
+        encoder_outputs, encoder_hidden = self.encoder(input_variable, encoder_hidden)
+
+        decoder_input = Variable(torch.LongTensor([[SOS_token]]))
+        decoder_context = Variable(torch.zeros(1, self.decoder.hidden_size))
+        decoder_hidden = encoder_hidden
+        if USE_CUDA:
+            decoder_input = decoder_input.cuda()
+            decoder_context = decoder_context.cuda()
+
+        decoder_output, decoder_context, decoder_hidden, decoder_attention = self.decoder(decoder_input, decoder_context, decoder_hidden, encoder_outputs)
+        topk = decoder_output.data.topk(self.top_k)
+        samples = [[] for i in range(self.top_k)]
+        dead_k = 0
+        final_samples = []
+        for index in range(self.top_k):
+            topk_prob = topk[0][0][index]
+            topk_index = int(topk[1][0][index])
+            samples[index] = [[topk_index], topk_prob, 0, 0, decoder_context, decoder_hidden, decoder_attention, encoder_outputs]
+
+        for _ in range(self.max_length):
+            tmp = []
+            for index in range(len(samples)):
+                tmp.extend(self.beamSearchInfer(samples[index], index))
+            samples = []
+
+            # 筛选出topk
+            df = pd.DataFrame(tmp)
+            df.columns = ['sequence', 'pre_socres', 'fin_scores', "ave_scores", "decoder_context", "decoder_hidden", "decoder_attention", "encoder_outputs"]
+            sequence_len = df.sequence.apply(lambda x:len(x))
+            df['ave_scores'] = df['fin_scores'] / sequence_len
+            df = df.sort_values('ave_scores', ascending=False).reset_index().drop(['index'], axis=1)
+            df = df[:(self.top_k-dead_k)]
+            for index in range(len(df)):
+                group = df.ix[index]
+                if group.tolist()[0][-1] == 1:
+                    final_samples.append(group.tolist())
+                    df = df.drop([index], axis=0)
+                    dead_k += 1
+                    print("drop {}, {}".format(group.tolist()[0], dead_k))
+            samples = df.values.tolist()
+            if len(samples) == 0:
+                break
+
+        if len(final_samples) < self.top_k:
+            final_samples.extend(samples[:(self.top_k-dead_k)])
+        return final_samples
+
+    def beamSearchInfer(self, sample, k):
+        samples = []
+        decoder_input = Variable(torch.LongTensor([[sample[0][-1]]]))
+        if USE_CUDA:
+            decoder_input = decoder_input.cuda()
+        sequence, pre_scores, fin_scores, ave_scores, decoder_context, decoder_hidden, decoder_attention, encoder_outputs = sample
+        decoder_output, decoder_context, decoder_hidden, decoder_attention = self.decoder(decoder_input, decoder_context, decoder_hidden, encoder_outputs)
+
+        # choose topk
+        topk = decoder_output.data.topk(self.top_k)
+        for k in range(self.top_k):
+            topk_prob = topk[0][0][k]
+            topk_index = int(topk[1][0][k])
+            pre_scores += topk_prob
+            fin_scores = pre_scores - (k - 1 ) * self.alpha
+            samples.append([sequence+[topk_index], pre_scores, fin_scores, ave_scores, decoder_context, decoder_hidden, decoder_attention, encoder_outputs])
+        return samples
 
 
 class node(object):
@@ -431,4 +577,4 @@ class node(object):
 
 if __name__ == '__main__':
     seq2seq = seq2seq(None)
-    seq2seq.train()
+    seq2seq.predict()
